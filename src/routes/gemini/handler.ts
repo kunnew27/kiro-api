@@ -1,5 +1,5 @@
 /**
- * OpenAI Chat Completions Handler
+ * Gemini GenerateContent Handler
  */
 
 import type { Context } from "hono"
@@ -7,38 +7,47 @@ import { stream } from "hono/streaming"
 import consola from "consola"
 
 import { KiroAuthManager } from "~/lib/auth"
-import { config } from "~/lib/config"
 import { generateConversationId } from "~/lib/utils"
-import { formatOpenAIError, ValidationError, UpstreamError } from "~/lib/error"
+import { formatGeminiError, ValidationError, UpstreamError } from "~/lib/error"
 import { KiroHttpClient } from "~/services/kiro/client"
-import { buildKiroPayload } from "~/services/kiro/converters"
-import { streamKiroToOpenAI, collectOpenAIResponse } from "~/services/kiro/streaming"
-import type { OpenAIChatRequest } from "./types"
+import { buildKiroPayload, convertGeminiToOpenAIRequest } from "~/services/kiro/converters"
+import { streamKiroToGemini, collectGeminiResponse } from "~/services/kiro/streaming"
+import type { GeminiGenerateContentRequest } from "./types"
 
 /**
- * Handle OpenAI chat completions request
+ * Handle Gemini generateContent request
  */
-export async function handleChatCompletions(
+export async function handleGenerateContent(
     c: Context,
-    authManager: KiroAuthManager
+    authManager: KiroAuthManager,
+    isStreaming: boolean = false
 ): Promise<Response> {
-    let requestData: OpenAIChatRequest
+    let requestData: GeminiGenerateContentRequest
 
     try {
-        requestData = await c.req.json<OpenAIChatRequest>()
+        requestData = await c.req.json<GeminiGenerateContentRequest>()
     } catch (e) {
-        return c.json(formatOpenAIError(new ValidationError("Invalid JSON body")), 400)
+        return c.json(formatGeminiError(new ValidationError("Invalid JSON body")), 400)
     }
 
     // Validate required fields
-    if (!requestData.model) {
-        return c.json(formatOpenAIError(new ValidationError("model is required")), 400)
-    }
-    if (!requestData.messages || requestData.messages.length === 0) {
-        return c.json(formatOpenAIError(new ValidationError("messages is required and must not be empty")), 400)
+    if (!requestData.contents || requestData.contents.length === 0) {
+        return c.json(formatGeminiError(new ValidationError("contents is required and must not be empty")), 400)
     }
 
-    consola.info(`Request to /v1/chat/completions (model=${requestData.model}, stream=${requestData.stream})`)
+    // Get model from URL path parameter
+    const model = c.req.param("model") || "gemini-pro"
+
+    consola.info(`Request to Gemini generateContent (model=${model}, stream=${isStreaming})`)
+
+    // Convert Gemini request to OpenAI format for internal processing
+    let openaiRequest
+    try {
+        openaiRequest = convertGeminiToOpenAIRequest(requestData, model)
+    } catch (e: any) {
+        consola.error(`Failed to convert Gemini request: ${e.message}`)
+        return c.json(formatGeminiError(new ValidationError(`Invalid request format: ${e.message}`)), 400)
+    }
 
     // Generate conversation ID
     const conversationId = generateConversationId()
@@ -46,9 +55,9 @@ export async function handleChatCompletions(
     // Build Kiro payload
     let kiroPayload: any
     try {
-        kiroPayload = buildKiroPayload(requestData, conversationId, authManager.profileArn || "")
+        kiroPayload = buildKiroPayload(openaiRequest, conversationId, authManager.profileArn || "")
     } catch (e: any) {
-        return c.json(formatOpenAIError(new ValidationError(e.message)), 400)
+        return c.json(formatGeminiError(new ValidationError(e.message)), 400)
     }
 
     // Create HTTP client
@@ -57,7 +66,7 @@ export async function handleChatCompletions(
 
     try {
         // Send request to Kiro API
-        const response = await httpClient.streamRequest(url, kiroPayload, requestData.model)
+        const response = await httpClient.streamRequest(url, kiroPayload, model)
 
         if (!response.ok) {
             const errorText = await response.text()
@@ -78,21 +87,21 @@ export async function handleChatCompletions(
             }
 
             return c.json(
-                formatOpenAIError(new UpstreamError(errorMessage, response.status)),
+                formatGeminiError(new UpstreamError(errorMessage, response.status)),
                 response.status as any
             )
         }
 
         // Prepare tokenizer data for usage calculation
-        const messagesForTokenizer = requestData.messages
-        const toolsForTokenizer = requestData.tools
+        const messagesForTokenizer = openaiRequest.messages
+        const toolsForTokenizer = openaiRequest.tools
 
         // Handle streaming vs non-streaming
-        if (requestData.stream) {
+        if (isStreaming) {
             // Streaming response
             return stream(c, async (streamWriter) => {
                 try {
-                    for await (const chunk of streamKiroToOpenAI(response, requestData.model, {
+                    for await (const chunk of streamKiroToGemini(response, model, {
                         requestMessages: messagesForTokenizer,
                         requestTools: toolsForTokenizer,
                     })) {
@@ -106,18 +115,17 @@ export async function handleChatCompletions(
             })
         } else {
             // Non-streaming response
-            const result = await collectOpenAIResponse(response, requestData.model, {
+            const result = await collectGeminiResponse(response, model, {
                 requestMessages: messagesForTokenizer,
                 requestTools: toolsForTokenizer,
             })
 
-            consola.info(`HTTP 200 - POST /v1/chat/completions (non-streaming) - completed`)
+            consola.info(`HTTP 200 - POST Gemini generateContent (non-streaming) - completed`)
             return c.json(result)
         }
 
     } catch (e: any) {
         consola.error(`Internal error: ${e.message}`)
-        return c.json(formatOpenAIError(e), e.statusCode || 500)
+        return c.json(formatGeminiError(e), e.statusCode || 500)
     }
 }
-

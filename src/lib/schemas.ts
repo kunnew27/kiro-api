@@ -265,3 +265,116 @@ export const MetricsResponseSchema = z.object({
     auth_cache_size: z.number(),
 }).openapi("MetricsResponse")
 
+// ==================================================================================================
+// Gemini Schemas
+// ==================================================================================================
+
+export const GeminiPartSchema = z.object({
+    text: z.string().optional(),
+    inlineData: z.object({
+        mimeType: z.string(),
+        data: z.string(),
+    }).optional(),
+    fileData: z.object({
+        mimeType: z.string(),
+        fileUri: z.string(),
+    }).optional(),
+    functionCall: z.object({
+        name: z.string(),
+        args: z.record(z.string(), z.any()),
+    }).optional(),
+    functionResponse: z.object({
+        name: z.string(),
+        response: z.object({
+            name: z.string(),
+            content: z.string(),
+        }),
+    }).optional(),
+}).openapi("GeminiPart")
+
+export const GeminiContentSchema = z.object({
+    role: z.enum(["user", "model"]),
+    parts: z.array(GeminiPartSchema),
+}).openapi("GeminiContent")
+
+export const GeminiFunctionDeclarationSchema = z.object({
+    name: z.string(),
+    description: z.string().optional(),
+    parameters: z.object({
+        type: z.string(),
+        properties: z.record(z.string(), z.any()).optional(),
+        required: z.array(z.string()).optional(),
+    }).optional(),
+}).openapi("GeminiFunctionDeclaration")
+
+export const GeminiToolSchema = z.object({
+    functionDeclarations: z.array(GeminiFunctionDeclarationSchema).optional(),
+}).openapi("GeminiTool")
+
+export const GeminiToolConfigSchema = z.object({
+    functionCallingConfig: z.object({
+        mode: z.enum(["AUTO", "ANY", "NONE"]),
+        allowedFunctionNames: z.array(z.string()).optional(),
+    }).optional(),
+}).openapi("GeminiToolConfig")
+
+export const GeminiGenerationConfigSchema = z.object({
+    temperature: z.number().optional(),
+    topP: z.number().optional(),
+    topK: z.number().optional(),
+    maxOutputTokens: z.number().optional(),
+    stopSequences: z.array(z.string()).optional(),
+    responseMimeType: z.string().optional(),
+    responseSchema: z.any().optional(),
+    responseModalities: z.array(z.string()).optional(),
+}).openapi("GeminiGenerationConfig")
+
+export const GeminiSystemInstructionSchema = z.object({
+    parts: z.array(GeminiPartSchema),
+}).openapi("GeminiSystemInstruction")
+
+export const GeminiGenerateContentRequestSchema = z.object({
+    contents: z.array(GeminiContentSchema),
+    systemInstruction: GeminiSystemInstructionSchema.optional(),
+    tools: z.array(GeminiToolSchema).optional(),
+    toolConfig: GeminiToolConfigSchema.optional(),
+    generationConfig: GeminiGenerationConfigSchema.optional(),
+}).openapi("GeminiGenerateContentRequest")
+
+export const GeminiUsageMetadataSchema = z.object({
+    promptTokenCount: z.number().optional(),
+    candidatesTokenCount: z.number().optional(),
+    totalTokenCount: z.number().optional(),
+    cachedContentTokenCount: z.number().optional(),
+    promptTokensDetails: z.array(z.object({
+        modality: z.string(),
+        tokenCount: z.number(),
+    })).optional(),
+    candidatesTokensDetails: z.array(z.object({
+        modality: z.string(),
+        tokenCount: z.number(),
+    })).optional(),
+    thoughtsTokenCount: z.number().optional(),
+}).openapi("GeminiUsageMetadata")
+
+export const GeminiCandidateSchema = z.object({
+    content: GeminiContentSchema,
+    finishReason: z.enum(["STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER"]).optional(),
+    safetyRatings: z.array(z.any()).optional(),
+    citationMetadata: z.any().optional(),
+}).openapi("GeminiCandidate")
+
+export const GeminiGenerateContentResponseSchema = z.object({
+    candidates: z.array(GeminiCandidateSchema),
+    usageMetadata: GeminiUsageMetadataSchema.optional(),
+    modelVersion: z.string().optional(),
+}).openapi("GeminiGenerateContentResponse")
+
+export const GeminiErrorResponseSchema = z.object({
+    error: z.object({
+        code: z.number(),
+        message: z.string(),
+        status: z.string(),
+    }),
+}).openapi("GeminiErrorResponse")
+

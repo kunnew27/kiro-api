@@ -13,6 +13,35 @@ OpenAI & Anthropic compatible API gateway for Kiro. Built with Bun and Hono.
 - **Auto Retry**: Automatic retry with exponential backoff
 - **Adaptive Timeout**: Longer timeouts for slow models (Opus)
 
+## Tech Stack
+
+### Core
+- **Runtime**: [Bun](https://bun.sh) - Fast JavaScript runtime with native TypeScript support
+- **Language**: TypeScript - Type-safe development
+- **Framework**: [Hono](https://hono.dev) - Lightweight, ultrafast web framework
+
+### Streaming & Parsing
+- **AWS Event Stream Parser** - Binary SSE stream parsing for Kiro API
+- **Custom Retry Logic** - First-token timeout with automatic retry (3 attempts)
+- **Consecutive Timeout Tolerance** - Handles slow models gracefully (3x tolerance)
+
+### Authentication & Token Management
+- **AWS Cognito** - Token refresh and authentication
+- **JWT Handling** - Secure token validation and renewal
+
+### Logging & Monitoring
+- **Consola** - Beautiful console logging with debug levels
+- **Structured Logging** - Indexed error messages with context
+
+### Image Processing
+- **Base64 Image Handling** - Anthropic & OpenAI format conversion
+- **Validation & Error Recovery** - Per-block error handling with detailed logging
+
+### Architecture Features
+- **Event-Driven Streaming** - AsyncGenerator-based stream processing
+- **Tool Call Parsing** - Bracket-style and structured function calls
+- **Multi-Format Support** - OpenAI ↔ Anthropic ↔ Kiro conversion layer
+
 ## Quick Start
 
 ### Prerequisites

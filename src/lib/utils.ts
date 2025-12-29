@@ -99,33 +99,146 @@ export function nowISO(): string {
 }
 
 // ==================================================================================================
-// Enhanced Utilities from kiro2Api
+// Enhanced Utilities from AIClient-2-API
 // ==================================================================================================
 
 /**
- * Safe JSON parsing with truncated escape sequence handling
+ * Repair malformed JSON strings
+ * Based on AIClient-2-API's repairJson function
+ */
+export function repairJson(jsonStr: string): string {
+    let repaired = jsonStr
+
+    // Remove trailing commas before } or ]
+    repaired = repaired.replace(/,\s*([}\]])/g, "$1")
+
+    // Add quotes to unquoted keys (e.g., {foo: "bar"} -> {"foo": "bar"})
+    repaired = repaired.replace(/([{,]\s*)([a-zA-Z0-9_]+?)\s*:/g, '$1"$2":')
+
+    // Fix unquoted string values that are simple identifiers
+    // Be careful not to break numbers, booleans, null
+    repaired = repaired.replace(/:\s*([a-zA-Z_][a-zA-Z0-9_]*)(?=[,\}\]])/g, (_, val) => {
+        // Don't quote boolean or null values
+        if (val === "true" || val === "false" || val === "null") {
+            return `: ${val}`
+        }
+        return `: "${val}"`
+    })
+
+    return repaired
+}
+
+/**
+ * Find matching bracket position considering nesting
+ * Supports both {} and []
+ */
+export function findMatchingBracket(text: string, startPos: number): number {
+    const openChar = text[startPos]
+    const closeChar = openChar === "{" ? "}" : openChar === "[" ? "]" : null
+
+    if (!closeChar) return -1
+
+    let depth = 1
+    let inString = false
+    let escapeNext = false
+
+    for (let i = startPos + 1; i < text.length; i++) {
+        const char = text[i]
+
+        if (escapeNext) {
+            escapeNext = false
+            continue
+        }
+
+        if (char === "\\") {
+            escapeNext = true
+            continue
+        }
+
+        if (char === '"') {
+            inString = !inString
+            continue
+        }
+
+        if (inString) continue
+
+        if (char === openChar) {
+            depth++
+        } else if (char === closeChar) {
+            depth--
+            if (depth === 0) {
+                return i
+            }
+        }
+    }
+
+    return -1
+}
+
+/**
+ * Safe JSON parsing with truncated escape sequence handling and repair
  * Handles incomplete escape sequences that can occur in streamed JSON
  */
 export function safeParseJSON<T = unknown>(str: string | null | undefined): T | string {
     if (!str) return str as string
 
-    let cleanedStr = str
+    let cleanedStr = str.trim()
 
-    // Handle truncated escape sequences
+    // Handle truncated escape sequences at the end
     if (cleanedStr.endsWith("\\") && !cleanedStr.endsWith("\\\\")) {
         cleanedStr = cleanedStr.substring(0, cleanedStr.length - 1)
     } else if (
         cleanedStr.endsWith("\\u") ||
         cleanedStr.endsWith("\\u0") ||
-        cleanedStr.endsWith("\\u00")
+        cleanedStr.endsWith("\\u00") ||
+        cleanedStr.endsWith("\\u000")
     ) {
         const idx = cleanedStr.lastIndexOf("\\u")
         cleanedStr = cleanedStr.substring(0, idx)
     }
 
+    // First attempt: direct parse
     try {
         return JSON.parse(cleanedStr || "{}") as T
     } catch {
+        // Continue to repair attempts
+    }
+
+    // Second attempt: try to repair common JSON issues
+    try {
+        const repaired = repairJson(cleanedStr)
+        return JSON.parse(repaired) as T
+    } catch {
+        // Continue to control character fix
+    }
+
+    // Third attempt: fix unescaped control characters in strings
+    try {
+        const fixed = cleanedStr.replace(/[\x00-\x1F\x7F]/g, (char) => {
+            const code = char.charCodeAt(0)
+            if (code === 0x09) return "\\t"
+            if (code === 0x0A) return "\\n"
+            if (code === 0x0D) return "\\r"
+            return `\\u${code.toString(16).padStart(4, "0")}`
+        })
+        return JSON.parse(fixed) as T
+    } catch {
+        // Continue to combined repair
+    }
+
+    // Fourth attempt: combine repair and control character fix
+    try {
+        let combined = repairJson(cleanedStr)
+        combined = combined.replace(/[\x00-\x1F\x7F]/g, (char) => {
+            const code = char.charCodeAt(0)
+            if (code === 0x09) return "\\t"
+            if (code === 0x0A) return "\\n"
+            if (code === 0x0D) return "\\r"
+            return `\\u${code.toString(16).padStart(4, "0")}`
+        })
+        return JSON.parse(combined) as T
+    } catch {
+        // Return original string on failure
         return str
     }
 }

@@ -8,6 +8,7 @@ import { getInternalModelId, config } from "~/lib/config"
 import { generateToolCallId } from "~/lib/utils"
 import type { OpenAIChatMessage, OpenAIChatRequest, OpenAITool } from "~/routes/openai/types"
 import type { AnthropicMessage, AnthropicMessagesRequest, AnthropicTool } from "~/routes/anthropic/types"
+import type { GeminiGenerateContentRequest, GeminiContent, GeminiPart, GeminiTool } from "~/routes/gemini/types"
 
 // ==================================================================================================
 // Convert Tools to Kiro Format (like kiro2Api's convertToQTool)
@@ -821,7 +822,7 @@ export function extractAnthropicSystemPrompt(system: any): string {
 export function convertAnthropicContentToOpenAI(
     content: any,
     role: string
-): { textContent: string | null; toolCalls: any[] | null; toolResults: any[] | null } {
+): { textContent: string | any[] | null; toolCalls: any[] | null; toolResults: any[] | null } {
     if (typeof content === "string") {
         return { textContent: content, toolCalls: null, toolResults: null }
     }
@@ -830,45 +831,92 @@ export function convertAnthropicContentToOpenAI(
         return { textContent: content ? String(content) : null, toolCalls: null, toolResults: null }
     }
 
-    const textParts: string[] = []
+    const contentBlocks: any[] = []
     const toolCalls: any[] = []
     const toolResults: any[] = []
 
-    for (const block of content) {
+    for (let idx = 0; idx < content.length; idx++) {
+        const block = content[idx]
         if (typeof block !== "object" || block === null) continue
 
         const blockType = block.type
 
-        if (blockType === "text") {
-            textParts.push(block.text || "")
-        } else if (blockType === "tool_use") {
-            // Assistant's tool call
-            toolCalls.push({
-                id: block.id || "",
-                type: "function",
-                function: {
-                    name: block.name || "",
-                    arguments: JSON.stringify(block.input || {}),
-                },
-            })
-        } else if (blockType === "tool_result") {
-            // User's tool result
-            toolResults.push({
-                type: "tool_result",
-                tool_use_id: block.tool_use_id || "",
-                content: extractToolResultContent(block.content),
-                is_error: block.is_error || false,
-            })
-        } else if (blockType === "thinking") {
-            // Thinking block - add to text with marker
-            const thinkingText = block.thinking || ""
-            if (thinkingText) {
-                textParts.push(`<thinking>${thinkingText}</thinking>`)
+        try {
+            if (blockType === "text") {
+                contentBlocks.push({ type: "text", text: block.text || "" })
+            } else if (blockType === "image") {
+                // Convert Anthropic image format to OpenAI image_url format
+                if (block.source && block.source.type === "base64") {
+                    const mediaType = block.source.media_type || "image/png"
+                    const base64Data = block.source.data || ""
+
+                    // Validate base64 data exists
+                    if (!base64Data) {
+                        consola.warn(`Image block ${idx} has empty base64 data, skipping`)
+                        continue
+                    }
+
+                    // Extract format for logging: 'image/png' -> 'png'
+                    const formatName = mediaType.split("/").pop() || "png"
+
+                    contentBlocks.push({
+                        type: "image_url",
+                        image_url: {
+                            url: `data:${mediaType};base64,${base64Data}`
+                        }
+                    })
+
+                    consola.debug(
+                        `Converted Anthropic image #${idx} to OpenAI format: ${formatName}, ` +
+                        `size: ${base64Data.length} chars`
+                    )
+                } else {
+                    consola.warn(`Image block ${idx} has unsupported source type, skipping`)
+                }
+            } else if (blockType === "tool_use") {
+                // Assistant's tool call
+                toolCalls.push({
+                    id: block.id || "",
+                    type: "function",
+                    function: {
+                        name: block.name || "",
+                        arguments: JSON.stringify(block.input || {}),
+                    },
+                })
+            } else if (blockType === "tool_result") {
+                // User's tool result
+                toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: block.tool_use_id || "",
+                    content: extractToolResultContent(block.content),
+                    is_error: block.is_error || false,
+                })
+            } else if (blockType === "thinking") {
+                // Thinking block - add to text with marker
+                const thinkingText = block.thinking || ""
+                if (thinkingText) {
+                    contentBlocks.push({ type: "text", text: `<thinking>${thinkingText}</thinking>` })
+                }
             }
+        } catch (e) {
+            consola.error(`Error processing content block ${idx}: ${e}`)
+            continue
         }
     }
 
-    const textContent = textParts.length > 0 ? textParts.join("\n") : null
+    // If we have images, return as array to preserve them for extractImagesFromContent()
+    // If only text, return as string for compatibility
+    let textContent: string | any[] | null = null
+    if (contentBlocks.length > 0) {
+        const hasImages = contentBlocks.some(b => b.type === "image")
+        if (hasImages) {
+            // Return array with both text and image blocks
+            textContent = contentBlocks
+        } else {
+            // Only text blocks - join into string
+            textContent = contentBlocks.map(b => b.text || "").join("\n")
+        }
+    }
 
     return {
         textContent,
@@ -982,5 +1030,1311 @@ export function convertAnthropicToOpenAIRequest(anthropicRequest: AnthropicMessa
         tool_choice: openaiToolChoice,
         stream: anthropicRequest.stream,
     }
+}
+
+// ==================================================================================================
+// Gemini -> OpenAI Conversion
+// ==================================================================================================
+
+/**
+ * Extract text from Gemini parts
+ */
+function extractTextFromGeminiParts(parts: GeminiPart[]): string {
+    return parts
+        .filter(p => p.text)
+        .map(p => p.text!)
+        .join("")
+}
+
+/**
+ * Convert Gemini tools to OpenAI format
+ */
+export function convertGeminiToolsToOpenAI(tools: GeminiTool[] | undefined): OpenAITool[] | null {
+    if (!tools || tools.length === 0) {
+        return null
+    }
+
+    const openaiTools: OpenAITool[] = []
+
+    for (const tool of tools) {
+        if (tool.functionDeclarations) {
+            for (const func of tool.functionDeclarations) {
+                openaiTools.push({
+                    type: "function",
+                    function: {
+                        name: func.name,
+                        description: func.description || undefined,
+                        parameters: func.parameters || { type: "object", properties: {} },
+                    },
+                })
+            }
+        }
+    }
+
+    return openaiTools.length > 0 ? openaiTools : null
+}
+
+/**
+ * Convert Gemini content to OpenAI messages
+ */
+export function convertGeminiContentToOpenAI(
+    contents: GeminiContent[],
+    systemInstruction?: { parts: GeminiPart[] }
+): OpenAIChatMessage[] {
+    const openaiMessages: OpenAIChatMessage[] = []
+
+    // Add system prompt if present
+    if (systemInstruction && systemInstruction.parts.length > 0) {
+        const systemText = extractTextFromGeminiParts(systemInstruction.parts)
+        if (systemText) {
+            openaiMessages.push({ role: "system", content: systemText })
+        }
+    }
+
+    for (const content of contents) {
+        const role = content.role === "model" ? "assistant" : "user"
+        const textParts: string[] = []
+        const toolCalls: any[] = []
+        const contentArray: any[] = []
+
+        for (const part of content.parts) {
+            // Handle text
+            if (part.text) {
+                textParts.push(part.text)
+            }
+
+            // Handle inline images
+            if (part.inlineData) {
+                contentArray.push({
+                    type: "image_url",
+                    image_url: {
+                        url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
+                    },
+                })
+            }
+
+            // Handle function calls (from model)
+            if (part.functionCall) {
+                toolCalls.push({
+                    id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+                    type: "function",
+                    function: {
+                        name: part.functionCall.name,
+                        arguments: JSON.stringify(part.functionCall.args || {}),
+                    },
+                })
+            }
+
+            // Handle function responses (from user)
+            if (part.functionResponse) {
+                // This becomes a tool result in the user message
+                contentArray.push({
+                    type: "tool_result",
+                    tool_use_id: part.functionResponse.name, // Use function name as ID
+                    content: part.functionResponse.response.content,
+                })
+            }
+        }
+
+        // Build the message
+        if (role === "assistant") {
+            const msg: OpenAIChatMessage = {
+                role: "assistant",
+                content: textParts.join("") || null,
+            }
+            if (toolCalls.length > 0) {
+                msg.tool_calls = toolCalls
+            }
+            openaiMessages.push(msg)
+        } else {
+            // User message
+            if (contentArray.length > 0) {
+                // Has images or tool results
+                if (textParts.length > 0) {
+                    contentArray.unshift({ type: "text", text: textParts.join("") })
+                }
+                openaiMessages.push({ role: "user", content: contentArray })
+            } else {
+                openaiMessages.push({ role: "user", content: textParts.join("") })
+            }
+        }
+    }
+
+    return openaiMessages
+}
+
+/**
+ * Convert Gemini GenerateContentRequest to OpenAI ChatCompletionRequest
+ */
+export function convertGeminiToOpenAIRequest(
+    geminiRequest: GeminiGenerateContentRequest,
+    model: string
+): OpenAIChatRequest {
+    // Convert messages
+    const openaiMessages = convertGeminiContentToOpenAI(
+        geminiRequest.contents,
+        geminiRequest.systemInstruction
+    )
+
+    // Convert tools
+    const openaiTools = convertGeminiToolsToOpenAI(geminiRequest.tools)
+
+    // Convert tool_choice from toolConfig
+    let openaiToolChoice: any = undefined
+    if (geminiRequest.toolConfig?.functionCallingConfig) {
+        const mode = geminiRequest.toolConfig.functionCallingConfig.mode
+        if (mode === "AUTO") {
+            openaiToolChoice = "auto"
+        } else if (mode === "ANY") {
+            openaiToolChoice = "required"
+        } else if (mode === "NONE") {
+            openaiToolChoice = "none"
+        }
+    }
+
+    // Extract generation config
+    const genConfig = geminiRequest.generationConfig || {}
+
+    return {
+        model: model,
+        messages: openaiMessages,
+        max_tokens: genConfig.maxOutputTokens,
+        temperature: genConfig.temperature,
+        top_p: genConfig.topP,
+        stop: genConfig.stopSequences,
+        tools: openaiTools || undefined,
+        tool_choice: openaiToolChoice,
+        stream: false, // Will be set by handler
+    }
+}
+
+// ==================================================================================================
+// Response Converters (from AIClient-2-API patterns)
+// ==================================================================================================
+
+/**
+ * Convert OpenAI response to Anthropic response format
+ */
+export function convertOpenAIResponseToAnthropic(openaiResponse: any, model: string): any {
+    const choice = openaiResponse.choices?.[0]
+    const message = choice?.message || {}
+    const usage = openaiResponse.usage || {}
+
+    // Build content blocks
+    const contentBlocks: any[] = []
+
+    // Add text block if present
+    if (message.content) {
+        contentBlocks.push({
+            type: "text",
+            text: message.content,
+        })
+    }
+
+    // Convert tool_calls to tool_use blocks
+    if (message.tool_calls && message.tool_calls.length > 0) {
+        for (const tc of message.tool_calls) {
+            let input = {}
+            try {
+                input = JSON.parse(tc.function?.arguments || "{}")
+            } catch {
+                // Keep empty object
+            }
+
+            contentBlocks.push({
+                type: "tool_use",
+                id: tc.id || `toolu_${Date.now()}`,
+                name: tc.function?.name || "",
+                input,
+            })
+        }
+    }
+
+    // Map finish reason
+    let stopReason = "end_turn"
+    if (choice?.finish_reason === "tool_calls") {
+        stopReason = "tool_use"
+    } else if (choice?.finish_reason === "length") {
+        stopReason = "max_tokens"
+    } else if (choice?.finish_reason === "content_filter") {
+        stopReason = "stop_sequence"
+    }
+
+    return {
+        id: openaiResponse.id ? `msg_${openaiResponse.id.slice(8)}` : `msg_${Date.now()}`,
+        type: "message",
+        role: "assistant",
+        content: contentBlocks,
+        model,
+        stop_reason: stopReason,
+        stop_sequence: null,
+        usage: {
+            input_tokens: usage.prompt_tokens || 0,
+            output_tokens: usage.completion_tokens || 0,
+        },
+    }
+}
+
+/**
+ * Convert OpenAI response to Gemini response format
+ */
+export function convertOpenAIResponseToGemini(openaiResponse: any, _model: string): any {
+    const choice = openaiResponse.choices?.[0]
+    const message = choice?.message || {}
+    const usage = openaiResponse.usage || {}
+
+    // Build parts array
+    const parts: any[] = []
+
+    // Add text part if present
+    if (message.content) {
+        parts.push({ text: message.content })
+    }
+
+    // Convert tool_calls to functionCall parts
+    if (message.tool_calls && message.tool_calls.length > 0) {
+        for (const tc of message.tool_calls) {
+            let args = {}
+            try {
+                args = JSON.parse(tc.function?.arguments || "{}")
+            } catch {
+                // Keep empty object
+            }
+
+            parts.push({
+                functionCall: {
+                    name: tc.function?.name || "",
+                    args,
+                },
+            })
+        }
+    }
+
+    // Map finish reason
+    let finishReason = "STOP"
+    if (choice?.finish_reason === "length") {
+        finishReason = "MAX_TOKENS"
+    } else if (choice?.finish_reason === "content_filter") {
+        finishReason = "SAFETY"
+    }
+
+    return {
+        candidates: [{
+            content: {
+                role: "model",
+                parts,
+            },
+            finishReason,
+        }],
+        usageMetadata: {
+            promptTokenCount: usage.prompt_tokens || 0,
+            candidatesTokenCount: usage.completion_tokens || 0,
+            totalTokenCount: usage.total_tokens || 0,
+        },
+    }
+}
+
+/**
+ * Convert Anthropic response to OpenAI response format
+ */
+export function convertAnthropicResponseToOpenAI(anthropicResponse: any, model: string): any {
+    const content = anthropicResponse.content || []
+    const usage = anthropicResponse.usage || {}
+
+    // Extract text and tool calls
+    let textContent = ""
+    const toolCalls: any[] = []
+
+    for (const block of content) {
+        if (block.type === "text") {
+            textContent += block.text || ""
+        } else if (block.type === "tool_use") {
+            toolCalls.push({
+                id: block.id || `call_${Date.now()}`,
+                type: "function",
+                function: {
+                    name: block.name || "",
+                    arguments: JSON.stringify(block.input || {}),
+                },
+            })
+        }
+    }
+
+    // Map finish reason
+    let finishReason = "stop"
+    if (anthropicResponse.stop_reason === "tool_use") {
+        finishReason = "tool_calls"
+    } else if (anthropicResponse.stop_reason === "max_tokens") {
+        finishReason = "length"
+    } else if (anthropicResponse.stop_reason === "stop_sequence") {
+        finishReason = "stop"
+    }
+
+    const message: any = {
+        role: "assistant",
+        content: textContent || null,
+    }
+
+    if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls
+    }
+
+    return {
+        id: anthropicResponse.id ? `chatcmpl-${anthropicResponse.id.slice(4)}` : `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+            index: 0,
+            message,
+            finish_reason: finishReason,
+        }],
+        usage: {
+            prompt_tokens: usage.input_tokens || 0,
+            completion_tokens: usage.output_tokens || 0,
+            total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+        },
+    }
+}
+
+/**
+ * Convert Gemini response to OpenAI response format
+ */
+export function convertGeminiResponseToOpenAI(geminiResponse: any, model: string): any {
+    const candidate = geminiResponse.candidates?.[0]
+    const content = candidate?.content
+    const parts = content?.parts || []
+    const usageMetadata = geminiResponse.usageMetadata || {}
+
+    // Extract text and function calls
+    let textContent = ""
+    const toolCalls: any[] = []
+
+    for (const part of parts) {
+        if (part.text) {
+            textContent += part.text
+        } else if (part.functionCall) {
+            toolCalls.push({
+                id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+                type: "function",
+                function: {
+                    name: part.functionCall.name || "",
+                    arguments: JSON.stringify(part.functionCall.args || {}),
+                },
+            })
+        }
+    }
+
+    // Map finish reason
+    let finishReason = "stop"
+    if (candidate?.finishReason === "MAX_TOKENS") {
+        finishReason = "length"
+    } else if (candidate?.finishReason === "SAFETY") {
+        finishReason = "content_filter"
+    }
+
+    if (toolCalls.length > 0) {
+        finishReason = "tool_calls"
+    }
+
+    const message: any = {
+        role: "assistant",
+        content: textContent || null,
+    }
+
+    if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls
+    }
+
+    return {
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+            index: 0,
+            message,
+            finish_reason: finishReason,
+        }],
+        usage: {
+            prompt_tokens: usageMetadata.promptTokenCount || 0,
+            completion_tokens: usageMetadata.candidatesTokenCount || 0,
+            total_tokens: usageMetadata.totalTokenCount || 0,
+        },
+    }
+}
+
+// ==================================================================================================
+// Error Response Formatters (from AIClient-2-API)
+// ==================================================================================================
+
+type ErrorResponseFormat = "openai" | "anthropic" | "gemini"
+
+/**
+ * Get error type from HTTP status code
+ */
+function getErrorType(statusCode: number): string {
+    if (statusCode === 401) return "authentication_error"
+    if (statusCode === 403) return "permission_error"
+    if (statusCode === 429) return "rate_limit_error"
+    if (statusCode >= 500) return "server_error"
+    return "invalid_request_error"
+}
+
+/**
+ * Get Gemini status from HTTP status code
+ */
+function getGeminiStatus(statusCode: number): string {
+    if (statusCode === 400) return "INVALID_ARGUMENT"
+    if (statusCode === 401) return "UNAUTHENTICATED"
+    if (statusCode === 403) return "PERMISSION_DENIED"
+    if (statusCode === 404) return "NOT_FOUND"
+    if (statusCode === 429) return "RESOURCE_EXHAUSTED"
+    if (statusCode >= 500) return "INTERNAL"
+    return "UNKNOWN"
+}
+
+/**
+ * Create error response in specified format
+ */
+export function createErrorResponse(
+    error: Error | { message: string; status?: number },
+    format: ErrorResponseFormat
+): any {
+    const statusCode = (error as any).status || 500
+    const errorMessage = error.message || "An error occurred"
+
+    switch (format) {
+        case "openai":
+            return {
+                error: {
+                    message: errorMessage,
+                    type: getErrorType(statusCode),
+                    code: getErrorType(statusCode),
+                },
+            }
+
+        case "anthropic":
+            return {
+                type: "error",
+                error: {
+                    type: getErrorType(statusCode),
+                    message: errorMessage,
+                },
+            }
+
+        case "gemini":
+            return {
+                error: {
+                    code: statusCode,
+                    message: errorMessage,
+                    status: getGeminiStatus(statusCode),
+                },
+            }
+
+        default:
+            return {
+                error: {
+                    message: errorMessage,
+                    type: getErrorType(statusCode),
+                },
+            }
+    }
+}
+
+/**
+ * Create streaming error response in specified format
+ */
+export function createStreamErrorResponse(
+    error: Error | { message: string; status?: number },
+    format: ErrorResponseFormat
+): string {
+    const statusCode = (error as any).status || 500
+    const errorMessage = error.message || "An error occurred during streaming"
+
+    switch (format) {
+        case "openai":
+            return `data: ${JSON.stringify({
+                error: {
+                    message: errorMessage,
+                    type: getErrorType(statusCode),
+                    code: null,
+                },
+            })}\n\n`
+
+        case "anthropic":
+            return `event: error\ndata: ${JSON.stringify({
+                type: "error",
+                error: {
+                    type: getErrorType(statusCode),
+                    message: errorMessage,
+                },
+            })}\n\n`
+
+        case "gemini":
+            return `data: ${JSON.stringify({
+                error: {
+                    code: statusCode,
+                    message: errorMessage,
+                    status: getGeminiStatus(statusCode),
+                },
+            })}\n\n`
+
+        default:
+            return `data: ${JSON.stringify({
+                error: {
+                    message: errorMessage,
+                    type: getErrorType(statusCode),
+                },
+            })}\n\n`
+    }
+}
+
+// ==================================================================================================
+// Stream Chunk Converters (from AIClient-2-API)
+// Converts streaming chunks between protocols
+// ==================================================================================================
+
+/**
+ * Stream chunk types for Anthropic SSE
+ */
+export type AnthropicStreamChunkType =
+    | "message_start"
+    | "content_block_start"
+    | "content_block_delta"
+    | "content_block_stop"
+    | "message_delta"
+    | "message_stop"
+    | "ping"
+    | "error"
+
+export interface AnthropicStreamChunk {
+    type: AnthropicStreamChunkType
+    message?: any
+    index?: number
+    content_block?: any
+    delta?: any
+    usage?: any
+    error?: any
+}
+
+/**
+ * Convert Anthropic stream chunk to OpenAI stream chunk format
+ * Based on AIClient-2-API's ClaudeConverter.toOpenAIStreamChunk
+ */
+export function convertAnthropicChunkToOpenAI(chunk: AnthropicStreamChunk, model: string): any {
+    if (!chunk) return null
+
+    const chunkId = `chatcmpl-${Date.now()}`
+    const timestamp = Math.floor(Date.now() / 1000)
+
+    // message_start event
+    if (chunk.type === "message_start") {
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            system_fingerprint: "",
+            choices: [{
+                index: 0,
+                delta: { role: "assistant", content: "" },
+                finish_reason: null
+            }],
+            usage: {
+                prompt_tokens: chunk.message?.usage?.input_tokens || 0,
+                completion_tokens: 0,
+                total_tokens: chunk.message?.usage?.input_tokens || 0,
+                cached_tokens: chunk.message?.usage?.cache_read_input_tokens || 0
+            }
+        }
+    }
+
+    // content_block_start event
+    if (chunk.type === "content_block_start") {
+        const contentBlock = chunk.content_block
+
+        // Handle tool_use type
+        if (contentBlock && contentBlock.type === "tool_use") {
+            return {
+                id: chunkId,
+                object: "chat.completion.chunk",
+                created: timestamp,
+                model,
+                system_fingerprint: "",
+                choices: [{
+                    index: 0,
+                    delta: {
+                        tool_calls: [{
+                            index: chunk.index || 0,
+                            id: contentBlock.id,
+                            type: "function",
+                            function: {
+                                name: contentBlock.name,
+                                arguments: ""
+                            }
+                        }]
+                    },
+                    finish_reason: null
+                }]
+            }
+        }
+
+        // Handle text type
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            system_fingerprint: "",
+            choices: [{
+                index: 0,
+                delta: { content: "" },
+                finish_reason: null
+            }]
+        }
+    }
+
+    // content_block_delta event
+    if (chunk.type === "content_block_delta") {
+        const delta = chunk.delta
+
+        // Handle text_delta
+        if (delta && delta.type === "text_delta") {
+            return {
+                id: chunkId,
+                object: "chat.completion.chunk",
+                created: timestamp,
+                model,
+                system_fingerprint: "",
+                choices: [{
+                    index: 0,
+                    delta: { content: delta.text || "" },
+                    finish_reason: null
+                }]
+            }
+        }
+
+        // Handle thinking_delta (reasoning content)
+        if (delta && delta.type === "thinking_delta") {
+            return {
+                id: chunkId,
+                object: "chat.completion.chunk",
+                created: timestamp,
+                model,
+                system_fingerprint: "",
+                choices: [{
+                    index: 0,
+                    delta: { reasoning_content: delta.thinking || "" },
+                    finish_reason: null
+                }]
+            }
+        }
+
+        // Handle input_json_delta (tool arguments)
+        if (delta && delta.type === "input_json_delta") {
+            return {
+                id: chunkId,
+                object: "chat.completion.chunk",
+                created: timestamp,
+                model,
+                system_fingerprint: "",
+                choices: [{
+                    index: 0,
+                    delta: {
+                        tool_calls: [{
+                            index: chunk.index || 0,
+                            function: { arguments: delta.partial_json || "" }
+                        }]
+                    },
+                    finish_reason: null
+                }]
+            }
+        }
+    }
+
+    // content_block_stop event
+    if (chunk.type === "content_block_stop") {
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            system_fingerprint: "",
+            choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: null
+            }]
+        }
+    }
+
+    // message_delta event
+    if (chunk.type === "message_delta") {
+        const stopReason = chunk.delta?.stop_reason
+        const finishReason = stopReason === "end_turn" ? "stop" :
+                            stopReason === "max_tokens" ? "length" :
+                            stopReason === "tool_use" ? "tool_calls" :
+                            stopReason || "stop"
+
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            system_fingerprint: "",
+            choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: finishReason
+            }],
+            usage: chunk.usage ? {
+                prompt_tokens: chunk.usage.input_tokens || 0,
+                completion_tokens: chunk.usage.output_tokens || 0,
+                total_tokens: (chunk.usage.input_tokens || 0) + (chunk.usage.output_tokens || 0),
+                cached_tokens: chunk.usage.cache_read_input_tokens || 0,
+                prompt_tokens_details: {
+                    cached_tokens: chunk.usage.cache_read_input_tokens || 0
+                }
+            } : undefined
+        }
+    }
+
+    // message_stop event
+    if (chunk.type === "message_stop") {
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            system_fingerprint: "",
+            choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: "stop"
+            }]
+        }
+    }
+
+    return null
+}
+
+/**
+ * Convert Anthropic stream chunk to Gemini stream chunk format
+ * Based on AIClient-2-API's ClaudeConverter.toGeminiStreamChunk
+ */
+export function convertAnthropicChunkToGemini(chunk: AnthropicStreamChunk, _model: string): any {
+    if (!chunk) return null
+
+    // content_block_delta event
+    if (chunk.type === "content_block_delta") {
+        const delta = chunk.delta
+
+        // Handle text_delta
+        if (delta && delta.type === "text_delta") {
+            return {
+                candidates: [{
+                    content: {
+                        role: "model",
+                        parts: [{ text: delta.text || "" }]
+                    }
+                }]
+            }
+        }
+
+        // Handle thinking_delta - map to text
+        if (delta && delta.type === "thinking_delta") {
+            return {
+                candidates: [{
+                    content: {
+                        role: "model",
+                        parts: [{ text: delta.thinking || "" }]
+                    }
+                }]
+            }
+        }
+
+        // Handle input_json_delta (tool arguments) - skip for now
+        if (delta && delta.type === "input_json_delta") {
+            return null
+        }
+    }
+
+    // content_block_start for tool_use
+    if (chunk.type === "content_block_start" && chunk.content_block?.type === "tool_use") {
+        return {
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [{
+                        functionCall: {
+                            name: chunk.content_block.name,
+                            args: {}
+                        }
+                    }]
+                }
+            }]
+        }
+    }
+
+    // message_delta event - stream end
+    if (chunk.type === "message_delta") {
+        const stopReason = chunk.delta?.stop_reason
+        const result: any = {
+            candidates: [{
+                finishReason: stopReason === "end_turn" ? "STOP" :
+                              stopReason === "max_tokens" ? "MAX_TOKENS" :
+                              "STOP"
+            }]
+        }
+
+        // Add usage info
+        if (chunk.usage) {
+            result.usageMetadata = {
+                promptTokenCount: chunk.usage.input_tokens || 0,
+                candidatesTokenCount: chunk.usage.output_tokens || 0,
+                totalTokenCount: (chunk.usage.input_tokens || 0) + (chunk.usage.output_tokens || 0),
+                cachedContentTokenCount: chunk.usage.cache_read_input_tokens || 0
+            }
+        }
+
+        return result
+    }
+
+    return null
+}
+
+/**
+ * OpenAI stream chunk interface
+ */
+export interface OpenAIStreamChunk {
+    id: string
+    object: string
+    created: number
+    model: string
+    choices: Array<{
+        index: number
+        delta: {
+            role?: string
+            content?: string
+            tool_calls?: any[]
+            reasoning_content?: string
+        }
+        finish_reason: string | null
+    }>
+    usage?: any
+}
+
+/**
+ * Convert OpenAI stream chunk to Anthropic stream chunk format
+ * Based on AIClient-2-API's OpenAIConverter.toClaudeStreamChunk
+ */
+export function convertOpenAIChunkToAnthropic(chunk: OpenAIStreamChunk, model: string): AnthropicStreamChunk[] {
+    if (!chunk || !chunk.choices || chunk.choices.length === 0) return []
+
+    const events: AnthropicStreamChunk[] = []
+    const choice = chunk.choices[0]
+    const delta = choice.delta
+
+    // Handle role (message start)
+    if (delta.role === "assistant") {
+        events.push({
+            type: "message_start",
+            message: {
+                id: `msg_${chunk.id.slice(8)}`,
+                type: "message",
+                role: "assistant",
+                content: [],
+                model,
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 }
+            }
+        })
+        events.push({
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" }
+        })
+    }
+
+    // Handle content delta
+    if (delta.content) {
+        events.push({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: delta.content }
+        })
+    }
+
+    // Handle reasoning content (thinking)
+    if (delta.reasoning_content) {
+        events.push({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "thinking_delta", thinking: delta.reasoning_content }
+        })
+    }
+
+    // Handle tool_calls
+    if (delta.tool_calls && delta.tool_calls.length > 0) {
+        for (const tc of delta.tool_calls) {
+            const tcIndex = tc.index || 0
+
+            // Tool call start (has id and name)
+            if (tc.id && tc.function?.name) {
+                events.push({
+                    type: "content_block_start",
+                    index: tcIndex,
+                    content_block: {
+                        type: "tool_use",
+                        id: tc.id,
+                        name: tc.function.name,
+                        input: {}
+                    }
+                })
+            }
+
+            // Tool call arguments delta
+            if (tc.function?.arguments) {
+                events.push({
+                    type: "content_block_delta",
+                    index: tcIndex,
+                    delta: {
+                        type: "input_json_delta",
+                        partial_json: tc.function.arguments
+                    }
+                })
+            }
+        }
+    }
+
+    // Handle finish_reason
+    if (choice.finish_reason) {
+        // Close content block
+        events.push({
+            type: "content_block_stop",
+            index: 0
+        })
+
+        // Map finish reason
+        let stopReason = "end_turn"
+        if (choice.finish_reason === "tool_calls") {
+            stopReason = "tool_use"
+        } else if (choice.finish_reason === "length") {
+            stopReason = "max_tokens"
+        } else if (choice.finish_reason === "content_filter") {
+            stopReason = "stop_sequence"
+        }
+
+        events.push({
+            type: "message_delta",
+            delta: { stop_reason: stopReason, stop_sequence: null },
+            usage: chunk.usage ? {
+                output_tokens: chunk.usage.completion_tokens || 0
+            } : undefined
+        })
+
+        events.push({ type: "message_stop" })
+    }
+
+    return events
+}
+
+/**
+ * Convert OpenAI stream chunk to Gemini stream chunk format
+ * Based on AIClient-2-API's OpenAIConverter.toGeminiStreamChunk
+ */
+export function convertOpenAIChunkToGemini(chunk: OpenAIStreamChunk, _model: string): any {
+    if (!chunk || !chunk.choices || chunk.choices.length === 0) return null
+
+    const choice = chunk.choices[0]
+    const delta = choice.delta
+
+    // Handle content delta
+    if (delta.content) {
+        return {
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [{ text: delta.content }]
+                }
+            }]
+        }
+    }
+
+    // Handle reasoning content
+    if (delta.reasoning_content) {
+        return {
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [{ text: delta.reasoning_content }]
+                }
+            }]
+        }
+    }
+
+    // Handle tool_calls
+    if (delta.tool_calls && delta.tool_calls.length > 0) {
+        const parts: any[] = []
+        for (const tc of delta.tool_calls) {
+            if (tc.function?.name) {
+                let args = {}
+                if (tc.function.arguments) {
+                    try {
+                        args = JSON.parse(tc.function.arguments)
+                    } catch {
+                        // Keep empty object
+                    }
+                }
+                parts.push({
+                    functionCall: {
+                        name: tc.function.name,
+                        args
+                    }
+                })
+            }
+        }
+        if (parts.length > 0) {
+            return {
+                candidates: [{
+                    content: {
+                        role: "model",
+                        parts
+                    }
+                }]
+            }
+        }
+    }
+
+    // Handle finish_reason
+    if (choice.finish_reason) {
+        let finishReason = "STOP"
+        if (choice.finish_reason === "length") {
+            finishReason = "MAX_TOKENS"
+        } else if (choice.finish_reason === "content_filter") {
+            finishReason = "SAFETY"
+        }
+
+        return {
+            candidates: [{
+                content: { role: "model", parts: [] },
+                finishReason
+            }],
+            usageMetadata: chunk.usage ? {
+                promptTokenCount: chunk.usage.prompt_tokens || 0,
+                candidatesTokenCount: chunk.usage.completion_tokens || 0,
+                totalTokenCount: chunk.usage.total_tokens || 0
+            } : undefined
+        }
+    }
+
+    return null
+}
+
+/**
+ * Gemini stream chunk interface
+ */
+export interface GeminiStreamChunk {
+    candidates?: Array<{
+        content?: {
+            role: string
+            parts: Array<{
+                text?: string
+                functionCall?: { name: string; args: any }
+            }>
+        }
+        finishReason?: string
+    }>
+    usageMetadata?: {
+        promptTokenCount?: number
+        candidatesTokenCount?: number
+        totalTokenCount?: number
+    }
+}
+
+/**
+ * Convert Gemini stream chunk to OpenAI stream chunk format
+ * Based on AIClient-2-API's GeminiConverter.toOpenAIStreamChunk
+ */
+export function convertGeminiChunkToOpenAI(chunk: GeminiStreamChunk, model: string): any {
+    if (!chunk || !chunk.candidates || chunk.candidates.length === 0) return null
+
+    const candidate = chunk.candidates[0]
+    const content = candidate.content
+    const parts = content?.parts || []
+
+    const chunkId = `chatcmpl-${Date.now()}`
+    const timestamp = Math.floor(Date.now() / 1000)
+
+    // Handle text content
+    const textParts = parts.filter(p => p.text).map(p => p.text).join("")
+    if (textParts) {
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            choices: [{
+                index: 0,
+                delta: { content: textParts },
+                finish_reason: null
+            }]
+        }
+    }
+
+    // Handle function calls
+    const functionCalls = parts.filter(p => p.functionCall)
+    if (functionCalls.length > 0) {
+        const toolCalls = functionCalls.map((p, idx) => ({
+            index: idx,
+            id: `call_${Date.now()}_${idx}`,
+            type: "function",
+            function: {
+                name: p.functionCall!.name,
+                arguments: JSON.stringify(p.functionCall!.args || {})
+            }
+        }))
+
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            choices: [{
+                index: 0,
+                delta: { tool_calls: toolCalls },
+                finish_reason: null
+            }]
+        }
+    }
+
+    // Handle finish reason
+    if (candidate.finishReason) {
+        let finishReason = "stop"
+        if (candidate.finishReason === "MAX_TOKENS") {
+            finishReason = "length"
+        } else if (candidate.finishReason === "SAFETY") {
+            finishReason = "content_filter"
+        }
+
+        return {
+            id: chunkId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model,
+            choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: finishReason
+            }],
+            usage: chunk.usageMetadata ? {
+                prompt_tokens: chunk.usageMetadata.promptTokenCount || 0,
+                completion_tokens: chunk.usageMetadata.candidatesTokenCount || 0,
+                total_tokens: chunk.usageMetadata.totalTokenCount || 0
+            } : undefined
+        }
+    }
+
+    return null
+}
+
+/**
+ * Convert Gemini stream chunk to Anthropic stream chunk format
+ * Based on AIClient-2-API's GeminiConverter.toClaudeStreamChunk
+ */
+export function convertGeminiChunkToAnthropic(chunk: GeminiStreamChunk, _model: string): AnthropicStreamChunk[] {
+    if (!chunk || !chunk.candidates || chunk.candidates.length === 0) return []
+
+    const events: AnthropicStreamChunk[] = []
+    const candidate = chunk.candidates[0]
+    const content = candidate.content
+    const parts = content?.parts || []
+
+    // Handle text content
+    const textParts = parts.filter(p => p.text)
+    for (const part of textParts) {
+        events.push({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: part.text }
+        })
+    }
+
+    // Handle function calls
+    const functionCalls = parts.filter(p => p.functionCall)
+    for (let idx = 0; idx < functionCalls.length; idx++) {
+        const fc = functionCalls[idx]
+        events.push({
+            type: "content_block_start",
+            index: idx + 1,
+            content_block: {
+                type: "tool_use",
+                id: `toolu_${Date.now()}_${idx}`,
+                name: fc.functionCall!.name,
+                input: {}
+            }
+        })
+        events.push({
+            type: "content_block_delta",
+            index: idx + 1,
+            delta: {
+                type: "input_json_delta",
+                partial_json: JSON.stringify(fc.functionCall!.args || {})
+            }
+        })
+        events.push({
+            type: "content_block_stop",
+            index: idx + 1
+        })
+    }
+
+    // Handle finish reason
+    if (candidate.finishReason) {
+        let stopReason = "end_turn"
+        if (candidate.finishReason === "MAX_TOKENS") {
+            stopReason = "max_tokens"
+        }
+        if (functionCalls.length > 0) {
+            stopReason = "tool_use"
+        }
+
+        events.push({
+            type: "message_delta",
+            delta: { stop_reason: stopReason, stop_sequence: null },
+            usage: chunk.usageMetadata ? {
+                output_tokens: chunk.usageMetadata.candidatesTokenCount || 0
+            } : undefined
+        })
+        events.push({ type: "message_stop" })
+    }
+
+    return events
+}
+
+// ==================================================================================================
+// Stream Chunk Formatter Helpers
+// ==================================================================================================
+
+/**
+ * Format Anthropic stream chunk as SSE string
+ */
+export function formatAnthropicChunkAsSSE(chunk: AnthropicStreamChunk): string {
+    return `event: ${chunk.type}\ndata: ${JSON.stringify(chunk)}\n\n`
+}
+
+/**
+ * Format OpenAI stream chunk as SSE string
+ */
+export function formatOpenAIChunkAsSSE(chunk: any): string {
+    return `data: ${JSON.stringify(chunk)}\n\n`
+}
+
+/**
+ * Format Gemini stream chunk as SSE string
+ */
+export function formatGeminiChunkAsSSE(chunk: any): string {
+    return `data: ${JSON.stringify(chunk)}\n\n`
 }
 

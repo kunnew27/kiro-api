@@ -136,13 +136,55 @@ function formatToolCallsForNonStreaming(toolCalls: ToolCall[]): any[] {
 }
 
 // ==================================================================================================
+// Timeout Helper
+// ==================================================================================================
+
+class StreamReadTimeoutError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = "StreamReadTimeoutError"
+    }
+}
+
+class FirstTokenTimeoutError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = "FirstTokenTimeoutError"
+    }
+}
+
+/**
+ * Read chunk with timeout
+ */
+async function readChunkWithTimeout(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    timeout: number
+): Promise<{ done: boolean; value?: Uint8Array }> {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new StreamReadTimeoutError(`Stream read timeout after ${timeout}ms`))
+        }, timeout)
+
+        reader.read()
+            .then(result => {
+                clearTimeout(timer)
+                resolve(result)
+            })
+            .catch(err => {
+                clearTimeout(timer)
+                reject(err)
+            })
+    })
+}
+
+// ==================================================================================================
 // OpenAI Streaming
 // ==================================================================================================
 
 /**
- * Stream Kiro response to OpenAI SSE format
+ * Stream Kiro response to OpenAI SSE format (internal)
  */
-export async function* streamKiroToOpenAI(
+async function* streamKiroToOpenAIInternal(
     response: Response,
     model: string,
     options: {
@@ -163,6 +205,7 @@ export async function* streamKiroToOpenAI(
     const contentParts: string[] = []
 
     const adaptiveStreamTimeout = getAdaptiveTimeout(model, config.streamReadTimeout) * 1000
+    const firstTokenTimeout = getAdaptiveTimeout(model, config.firstTokenTimeout || config.streamReadTimeout) * 1000
 
     try {
         const reader = response.body?.getReader()
@@ -171,11 +214,89 @@ export async function* streamKiroToOpenAI(
             return
         }
 
-        while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
+        // Wait for first chunk with timeout
+        let result: { done: boolean; value?: Uint8Array }
+        try {
+            result = await readChunkWithTimeout(reader, firstTokenTimeout)
+        } catch (e) {
+            if (e instanceof StreamReadTimeoutError) {
+                consola.warn(`First token timeout after ${firstTokenTimeout}ms (model: ${model})`)
+                throw new FirstTokenTimeoutError(`No response within ${firstTokenTimeout}ms`)
+            }
+            throw e
+        }
 
-            const events = parser.feed(value)
+        if (result.done) {
+            consola.debug("Empty response from Kiro API")
+            yield "data: [DONE]\n\n"
+            return
+        }
+
+        // Process first chunk
+        if (!result.value) {
+            consola.debug("No value in first chunk")
+            yield "data: [DONE]\n\n"
+            return
+        }
+        const events = parser.feed(result.value)
+        for (const event of events) {
+            if (event.type === "content") {
+                const content = event.data as string
+                contentParts.push(content)
+
+                const delta: any = { content }
+                if (firstChunk) {
+                    delta.role = "assistant"
+                    firstChunk = false
+                }
+
+                const openaiChunk = {
+                    id: completionId,
+                    object: "chat.completion.chunk",
+                    created: createdTime,
+                    model,
+                    choices: [{ index: 0, delta, finish_reason: null }],
+                }
+
+                yield `data: ${JSON.stringify(openaiChunk)}\n\n`
+
+            } else if (event.type === "usage") {
+                meteringData = event.data as number
+
+            } else if (event.type === "context_usage") {
+                contextUsagePercentage = event.data as number
+            }
+        }
+
+        // Continue with remaining chunks with consecutive timeout tolerance
+        let consecutiveTimeouts = 0
+        const maxConsecutiveTimeouts = 3
+
+        while (true) {
+            try {
+                result = await readChunkWithTimeout(reader, adaptiveStreamTimeout)
+                consecutiveTimeouts = 0 // Reset on success
+            } catch (e) {
+                if (e instanceof StreamReadTimeoutError) {
+                    consecutiveTimeouts++
+                    if (consecutiveTimeouts <= maxConsecutiveTimeouts) {
+                        consola.warn(
+                            `Stream read timeout ${consecutiveTimeouts}/${maxConsecutiveTimeouts} ` +
+                            `after ${adaptiveStreamTimeout}ms (model: ${model}). ` +
+                            `Model may be processing large content - continuing to wait...`
+                        )
+                        continue // Keep trying
+                    }
+                    consola.error(`Stream read timeout after ${maxConsecutiveTimeouts} consecutive timeouts`)
+                    throw new Error(`Stream timeout after ${maxConsecutiveTimeouts} consecutive failures`)
+                }
+                throw e
+            }
+
+            if (result.done) break
+            if (!result.value) continue
+
+            const events = parser.feed(result.value)
 
             for (const event of events) {
                 if (event.type === "content") {
@@ -273,6 +394,58 @@ export async function* streamKiroToOpenAI(
         consola.error(`Error during streaming: ${e}`)
         throw e
     }
+}
+
+/**
+ * Stream Kiro response to OpenAI SSE format with retry
+ */
+export async function* streamKiroToOpenAI(
+    response: Response,
+    model: string,
+    options: {
+        maxInputTokens?: number
+        requestMessages?: any[]
+        requestTools?: any[]
+    } = {}
+): AsyncGenerator<string> {
+    yield* streamKiroToOpenAIInternal(response, model, options)
+}
+
+/**
+ * Stream with automatic retry on first token timeout
+ */
+export async function* streamKiroWithRetry(
+    makeRequest: () => Promise<Response>,
+    model: string,
+    options: {
+        maxInputTokens?: number
+        requestMessages?: any[]
+        requestTools?: any[]
+        maxRetries?: number
+    } = {}
+): AsyncGenerator<string> {
+    const { maxRetries = 3, ...streamOptions } = options
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const response = await makeRequest()
+            yield* streamKiroToOpenAIInternal(response, model, streamOptions)
+            return // Success
+        } catch (e: any) {
+            if (e instanceof FirstTokenTimeoutError && attempt < maxRetries - 1) {
+                consola.warn(
+                    `First token timeout on attempt ${attempt + 1}/${maxRetries}, ` +
+                    `retrying... (model: ${model})`
+                )
+                await new Promise(resolve => setTimeout(resolve, 1000))
+                continue
+            }
+            // Re-throw if not a first token timeout or last attempt
+            throw e
+        }
+    }
+
+    throw new Error(`Failed after ${maxRetries} retries`)
 }
 
 /**
@@ -686,6 +859,268 @@ export async function collectAnthropicResponse(
             input_tokens: usage.promptTokens,
             output_tokens: usage.completionTokens,
         },
+    }
+}
+
+// ==================================================================================================
+// Gemini Streaming
+// ==================================================================================================
+
+/**
+ * Stream Kiro response to Gemini SSE format
+ */
+export async function* streamKiroToGemini(
+    response: Response,
+    model: string,
+    options: {
+        maxInputTokens?: number
+        requestMessages?: any[]
+        requestTools?: any[]
+    } = {}
+): AsyncGenerator<string> {
+    const { maxInputTokens = config.defaultMaxInputTokens, requestMessages, requestTools } = options
+
+    const parser = new AwsEventStreamParser()
+    let meteringData: number | null = null
+    let contextUsagePercentage: number | null = null
+    const contentParts: string[] = []
+
+    try {
+        const reader = response.body?.getReader()
+        if (!reader) {
+            const emptyResponse = {
+                candidates: [{
+                    content: { role: "model", parts: [] },
+                    finishReason: "STOP"
+                }]
+            }
+            yield `data: ${JSON.stringify(emptyResponse)}\n\n`
+            return
+        }
+
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            const events = parser.feed(value)
+
+            for (const event of events) {
+                if (event.type === "content") {
+                    const content = event.data as string
+                    contentParts.push(content)
+
+                    // Send streaming chunk in Gemini format
+                    const geminiChunk = {
+                        candidates: [{
+                            content: {
+                                role: "model",
+                                parts: [{ text: content }]
+                            }
+                        }]
+                    }
+
+                    yield `data: ${JSON.stringify(geminiChunk)}\n\n`
+
+                } else if (event.type === "usage") {
+                    meteringData = event.data as number
+
+                } else if (event.type === "context_usage") {
+                    contextUsagePercentage = event.data as number
+                }
+            }
+        }
+
+        // Combine content parts
+        const fullContent = contentParts.join("")
+
+        // Check bracket-style tool calls in full content
+        const bracketToolCalls = parseBracketToolCalls(fullContent)
+        const allToolCalls = deduplicateToolCalls([...parser.getToolCalls(), ...bracketToolCalls])
+
+        // Calculate usage
+        const usage = calculateUsageTokens(
+            fullContent,
+            contextUsagePercentage,
+            maxInputTokens,
+            requestMessages,
+            requestTools
+        )
+
+        // Send tool calls if any
+        if (allToolCalls.length > 0) {
+            consola.debug(`Processing ${allToolCalls.length} tool calls for Gemini streaming response`)
+
+            for (const tc of allToolCalls) {
+                const toolName = tc.function?.name || ""
+                const toolArgsStr = tc.function?.arguments || "{}"
+
+                let toolArgs = {}
+                try {
+                    toolArgs = JSON.parse(toolArgsStr)
+                } catch {
+                    // Keep empty object
+                }
+
+                const functionCallChunk = {
+                    candidates: [{
+                        content: {
+                            role: "model",
+                            parts: [{
+                                functionCall: {
+                                    name: toolName,
+                                    args: toolArgs
+                                }
+                            }]
+                        }
+                    }]
+                }
+                yield `data: ${JSON.stringify(functionCallChunk)}\n\n`
+            }
+        }
+
+        // Final chunk with finish reason and usage
+        const finishReason = allToolCalls.length > 0 ? "STOP" : "STOP"
+
+        const finalChunk = {
+            candidates: [{
+                content: { role: "model", parts: [] },
+                finishReason: finishReason
+            }],
+            usageMetadata: {
+                promptTokenCount: usage.promptTokens,
+                candidatesTokenCount: usage.completionTokens,
+                totalTokenCount: usage.totalTokens,
+            }
+        }
+
+        consola.debug(
+            `[Gemini Usage] ${model}: promptTokenCount=${usage.promptTokens}, candidatesTokenCount=${usage.completionTokens}, totalTokenCount=${usage.totalTokens}`
+        )
+
+        yield `data: ${JSON.stringify(finalChunk)}\n\n`
+
+    } catch (e) {
+        consola.error(`Error during Gemini streaming: ${e}`)
+        throw e
+    }
+}
+
+/**
+ * Collect stream response into single Gemini response
+ */
+export async function collectGeminiResponse(
+    response: Response,
+    model: string,
+    options: {
+        maxInputTokens?: number
+        requestMessages?: any[]
+        requestTools?: any[]
+    } = {}
+): Promise<any> {
+    const { maxInputTokens = config.defaultMaxInputTokens, requestMessages, requestTools } = options
+
+    const parser = new AwsEventStreamParser()
+    let meteringData: number | null = null
+    let contextUsagePercentage: number | null = null
+    const contentParts: string[] = []
+
+    try {
+        const reader = response.body?.getReader()
+        if (!reader) {
+            return {
+                candidates: [{
+                    content: { role: "model", parts: [] },
+                    finishReason: "STOP"
+                }],
+                usageMetadata: {
+                    promptTokenCount: 0,
+                    candidatesTokenCount: 0,
+                    totalTokenCount: 0,
+                }
+            }
+        }
+
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            const events = parser.feed(value)
+
+            for (const event of events) {
+                if (event.type === "content") {
+                    contentParts.push(event.data as string)
+                } else if (event.type === "usage") {
+                    meteringData = event.data as number
+                } else if (event.type === "context_usage") {
+                    contextUsagePercentage = event.data as number
+                }
+            }
+        }
+    } catch (e) {
+        consola.error(`Error collecting Gemini response: ${e}`)
+    }
+
+    // Combine content
+    const fullContent = contentParts.join("")
+
+    // Process tool calls
+    const bracketToolCalls = parseBracketToolCalls(fullContent)
+    const allToolCalls = deduplicateToolCalls([...parser.getToolCalls(), ...bracketToolCalls])
+
+    // Build parts array
+    const parts: any[] = []
+
+    // Add text part if there's content
+    if (fullContent) {
+        parts.push({ text: fullContent })
+    }
+
+    // Add function call parts
+    for (const tc of allToolCalls) {
+        const toolName = tc.function?.name || ""
+        const toolArgsStr = tc.function?.arguments || "{}"
+
+        let toolArgs = {}
+        try {
+            toolArgs = JSON.parse(toolArgsStr)
+        } catch {
+            // Keep empty object
+        }
+
+        parts.push({
+            functionCall: {
+                name: toolName,
+                args: toolArgs
+            }
+        })
+    }
+
+    // Calculate usage
+    const usage = calculateUsageTokens(
+        fullContent,
+        contextUsagePercentage,
+        maxInputTokens,
+        requestMessages,
+        requestTools
+    )
+
+    consola.debug(
+        `[Gemini Usage] ${model}: promptTokenCount=${usage.promptTokens}, candidatesTokenCount=${usage.completionTokens}, totalTokenCount=${usage.totalTokens}`
+    )
+
+    return {
+        candidates: [{
+            content: {
+                role: "model",
+                parts: parts
+            },
+            finishReason: "STOP"
+        }],
+        usageMetadata: {
+            promptTokenCount: usage.promptTokens,
+            candidatesTokenCount: usage.completionTokens,
+            totalTokenCount: usage.totalTokens,
+        }
     }
 }
 

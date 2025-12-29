@@ -9,6 +9,7 @@ import { apiReference } from "@scalar/hono-api-reference"
 
 import { openaiRoutes } from "./routes/openai/route"
 import { anthropicRoutes } from "./routes/anthropic/route"
+import { geminiRoutes } from "./routes/gemini/route"
 import { AVAILABLE_MODELS, APP_VERSION, APP_TITLE, APP_DESCRIPTION } from "./lib/config"
 import { nowSeconds, nowISO } from "./lib/utils"
 import { state } from "./lib/state"
@@ -209,6 +210,14 @@ server.route("/chat/completions", openaiRoutes)
 server.route("/v1/messages", anthropicRoutes)
 server.route("/v1beta/messages", anthropicRoutes)
 server.route("/messages", anthropicRoutes)
+
+// ==================================================================================================
+// Gemini Compatible Endpoints
+// ==================================================================================================
+
+// /v1beta/models/:model:generateContent, /v1beta/models/:model:streamGenerateContent
+server.route("/v1beta/models", geminiRoutes)
+server.route("/v1/models", geminiRoutes)
 
 // ==================================================================================================
 // Metrics Endpoint (Basic)

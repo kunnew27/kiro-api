@@ -158,3 +158,125 @@ export const APP_VERSION = "1.0.0"
 export const APP_TITLE = "Kiro API Gateway"
 export const APP_DESCRIPTION = "OpenAI & Anthropic compatible Kiro API gateway"
 
+// ==================================================================================================
+// Protocol Constants (from AIClient-2-API)
+// ==================================================================================================
+
+export const PROTOCOL = {
+    OPENAI: "openai",
+    ANTHROPIC: "anthropic",
+    GEMINI: "gemini",
+    KIRO: "kiro",
+    OLLAMA: "ollama",
+} as const
+
+export type Protocol = typeof PROTOCOL[keyof typeof PROTOCOL]
+
+export const ENDPOINT_TYPE = {
+    OPENAI_CHAT: "openai_chat",
+    OPENAI_COMPLETIONS: "openai_completions",
+    ANTHROPIC_MESSAGES: "anthropic_messages",
+    GEMINI_GENERATE: "gemini_generate",
+    MODEL_LIST: "model_list",
+} as const
+
+export type EndpointType = typeof ENDPOINT_TYPE[keyof typeof ENDPOINT_TYPE]
+
+// ==================================================================================================
+// Model Context Lengths (from AIClient-2-API)
+// ==================================================================================================
+
+export const MODEL_CONTEXT = {
+    // Claude models
+    CLAUDE_OPUS_45: { context: 200000, maxOutput: 64000 },
+    CLAUDE_SONNET_45: { context: 200000, maxOutput: 64000 },
+    CLAUDE_HAIKU_45: { context: 200000, maxOutput: 64000 },
+    CLAUDE_SONNET_4: { context: 200000, maxOutput: 64000 },
+    CLAUDE_SONNET_37: { context: 200000, maxOutput: 64000 },
+    CLAUDE_DEFAULT: { context: 200000, maxOutput: 8192 },
+
+    // Gemini models
+    GEMINI_25_PRO: { context: 1048576, maxOutput: 65534 },
+    GEMINI_25_FLASH: { context: 1048576, maxOutput: 65534 },
+    GEMINI_20_FLASH: { context: 1048576, maxOutput: 65534 },
+    GEMINI_15_PRO: { context: 2097152, maxOutput: 65534 },
+    GEMINI_DEFAULT: { context: 1048576, maxOutput: 65534 },
+
+    // OpenAI models
+    GPT4_TURBO: { context: 128000, maxOutput: 8192 },
+    GPT4_BASE: { context: 8192, maxOutput: 8192 },
+    GPT35_16K: { context: 16385, maxOutput: 8192 },
+    GPT35_BASE: { context: 4096, maxOutput: 4096 },
+
+    // Default
+    DEFAULT: { context: 128000, maxOutput: 8192 },
+} as const
+
+/**
+ * Get model context info by model name
+ */
+export function getModelContext(modelName: string): { context: number; maxOutput: number } {
+    const name = modelName.toLowerCase()
+
+    // Claude models
+    if (name.includes("claude")) {
+        if (name.includes("opus-4-5") || name.includes("opus-4.5")) {
+            return MODEL_CONTEXT.CLAUDE_OPUS_45
+        }
+        if (name.includes("sonnet-4-5") || name.includes("sonnet-4.5")) {
+            return MODEL_CONTEXT.CLAUDE_SONNET_45
+        }
+        if (name.includes("haiku-4-5") || name.includes("haiku-4.5")) {
+            return MODEL_CONTEXT.CLAUDE_HAIKU_45
+        }
+        if (name.includes("sonnet-4") || name.includes("sonnet-3-7") || name.includes("sonnet-3.7")) {
+            return MODEL_CONTEXT.CLAUDE_SONNET_4
+        }
+        return MODEL_CONTEXT.CLAUDE_DEFAULT
+    }
+
+    // Gemini models
+    if (name.includes("gemini")) {
+        if (name.includes("2.5") && name.includes("pro")) {
+            return MODEL_CONTEXT.GEMINI_25_PRO
+        }
+        if (name.includes("2.5") && name.includes("flash")) {
+            return MODEL_CONTEXT.GEMINI_25_FLASH
+        }
+        if (name.includes("2.0") && name.includes("flash")) {
+            return MODEL_CONTEXT.GEMINI_20_FLASH
+        }
+        if (name.includes("1.5") && name.includes("pro")) {
+            return MODEL_CONTEXT.GEMINI_15_PRO
+        }
+        return MODEL_CONTEXT.GEMINI_DEFAULT
+    }
+
+    // GPT models
+    if (name.includes("gpt-4")) {
+        if (name.includes("turbo") || name.includes("preview")) {
+            return MODEL_CONTEXT.GPT4_TURBO
+        }
+        return MODEL_CONTEXT.GPT4_BASE
+    }
+    if (name.includes("gpt-3.5")) {
+        if (name.includes("16k")) {
+            return MODEL_CONTEXT.GPT35_16K
+        }
+        return MODEL_CONTEXT.GPT35_BASE
+    }
+
+    return MODEL_CONTEXT.DEFAULT
+}
+
+// ==================================================================================================
+// Default Values for Conversions
+// ==================================================================================================
+
+export const DEFAULTS = {
+    MAX_TOKENS: 8192,
+    TEMPERATURE: 1.0,
+    TOP_P: 0.95,
+    TOP_K: 40,
+} as const
+
