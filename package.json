@@ -1,0 +1,24 @@
+{
+  "name": "kiro-api",
+  "version": "1.0.0",
+  "description": "Kiro API Gateway - OpenAI & Anthropic compatible API proxy for Kiro",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/main.ts start",
+    "start": "bun run src/main.ts start",
+    "build": "bun build src/main.ts --outdir dist --target bun",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@hono/zod-openapi": "^1.2.0",
+    "@scalar/hono-api-reference": "^0.9.30",
+    "citty": "^0.1.6",
+    "consola": "^3.2.3",
+    "hono": "^4.6.14",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.2"
+  }
+}
