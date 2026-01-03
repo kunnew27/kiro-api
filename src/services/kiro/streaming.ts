@@ -6,54 +6,8 @@
 import consola from "consola"
 import { config, getAdaptiveTimeout } from "~/lib/config"
 import { generateCompletionId, generateAnthropicMessageId, nowSeconds } from "~/lib/utils"
+import { countTokens, countMessageTokens, countToolsTokens } from "~/lib/tokenizer"
 import { AwsEventStreamParser, parseBracketToolCalls, deduplicateToolCalls, type ToolCall } from "./parsers"
-
-// ==================================================================================================
-// Token Counting (Simple estimation)
-// ==================================================================================================
-
-/**
- * Simple token count estimation (roughly 4 chars per token)
- */
-function countTokens(text: string): number {
-    if (!text) return 0
-    return Math.ceil(text.length / 4)
-}
-
-/**
- * Count tokens in messages
- */
-function countMessageTokens(messages: any[]): number {
-    let total = 0
-    for (const msg of messages) {
-        if (typeof msg.content === "string") {
-            total += countTokens(msg.content)
-        } else if (Array.isArray(msg.content)) {
-            for (const block of msg.content) {
-                if (block.text) {
-                    total += countTokens(block.text)
-                }
-            }
-        }
-    }
-    return total
-}
-
-/**
- * Count tokens in tools
- */
-function countToolsTokens(tools: any[]): number {
-    if (!tools) return 0
-    let total = 0
-    for (const tool of tools) {
-        if (tool.function) {
-            total += countTokens(tool.function.name || "")
-            total += countTokens(tool.function.description || "")
-            total += countTokens(JSON.stringify(tool.function.parameters || {}))
-        }
-    }
-    return total
-}
 
 // ==================================================================================================
 // Usage Calculation

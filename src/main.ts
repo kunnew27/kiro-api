@@ -11,6 +11,7 @@ import { server } from "./server"
 import { config, APP_VERSION, APP_TITLE } from "./lib/config"
 import { state } from "./lib/state"
 import { KiroAuthManager } from "./lib/auth"
+import { initTokenizer } from "./lib/tokenizer"
 
 const start = defineCommand({
     meta: {
@@ -40,6 +41,9 @@ const start = defineCommand({
         } else {
             consola.level = 3 // info
         }
+
+        // Initialize tokenizer (tiktoken)
+        await initTokenizer()
 
         // Validate configuration
         if (!config.proxyApiKey || config.proxyApiKey === "changeme_proxy_secret") {
