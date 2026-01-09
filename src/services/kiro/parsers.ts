@@ -338,11 +338,16 @@ export class AwsEventStreamParser {
       inputStr = data.input ? String(data.input) : "";
     }
 
+    const toolName = data.name || "";
+    consola.debug(
+      `[TOOL_START] name='${toolName}', initial_input=${inputStr.slice(0, 100)}`
+    );
+
     this.currentToolCall = {
       id: data.toolUseId || generateToolCallId(),
       type: "function",
       function: {
-        name: data.name || "",
+        name: toolName,
         arguments: inputStr,
       },
     };
@@ -359,6 +364,9 @@ export class AwsEventStreamParser {
    */
   private _processToolInputEvent(data: any): ParsedEvent | null {
     if (this.currentToolCall) {
+      const toolName = this.currentToolCall.function.name || "unknown";
+      const currentArgs = this.currentToolCall.function.arguments;
+
       if (typeof data.input === "object" && data.input !== null) {
         // Merge object inputs instead of concatenating stringified versions
         try {
@@ -378,8 +386,24 @@ export class AwsEventStreamParser {
           this.currentToolCall.function.arguments = JSON.stringify(data.input);
         }
       } else {
-        // String input - append as before (for streamed JSON fragments)
+        // String input - check if we already have valid JSON before appending
+        if (currentArgs.trim()) {
+          const parsed = safeParseJSON(currentArgs);
+          if (typeof parsed === "object" && parsed !== null) {
+            // Already have valid JSON - model is trying to append narrative text
+            const inputStr = data.input ? String(data.input) : "";
+            consola.warn(
+              `[TOOL_INPUT] name='${toolName}', IGNORING extra input after valid JSON: ${inputStr.slice(0, 50)}`
+            );
+            return null;
+          }
+        }
+
+        // Not yet valid, continue appending
         const inputStr = data.input ? String(data.input) : "";
+        consola.debug(
+          `[TOOL_INPUT] name='${toolName}', appending=${inputStr.slice(0, 100)}`
+        );
         this.currentToolCall.function.arguments += inputStr;
       }
     }
@@ -419,7 +443,37 @@ export class AwsEventStreamParser {
           this.currentToolCall.function.arguments = JSON.stringify(parsed);
           consola.debug(`Tool '${toolName}' arguments parsed successfully`);
         } else {
-          // Log as debug - tool call will still work with empty args
+          // Attempt to auto-complete incomplete JSON
+          let fixedArgs = args.trim();
+          
+          // Count opening and closing braces
+          const openBraces = (fixedArgs.match(/\{/g) || []).length;
+          const closeBraces = (fixedArgs.match(/\}/g) || []).length;
+          
+          if (openBraces > closeBraces) {
+            // Add missing closing braces
+            const missingBraces = openBraces - closeBraces;
+            fixedArgs += "}".repeat(missingBraces);
+            consola.info(
+              `Auto-completing JSON for '${toolName}': added ${missingBraces} closing brace(s)`
+            );
+            
+            // Try parsing again
+            const parsedFixed = safeParseJSON(fixedArgs);
+            if (typeof parsedFixed === "object" && parsedFixed !== null) {
+              this.currentToolCall.function.arguments = JSON.stringify(parsedFixed);
+              consola.info(
+                `Successfully auto-completed JSON for '${toolName}'`
+              );
+              this.toolCalls.push(this.currentToolCall);
+              this.currentToolCall = null;
+              return;
+            } else {
+              consola.warn(`Auto-complete failed for '${toolName}'`);
+            }
+          }
+          
+          // If auto-completion didn't help, use empty object
           consola.debug(
             `Could not parse tool '${toolName}' arguments, using empty object. Raw: ${args.slice(
               0,
